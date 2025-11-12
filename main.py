@@ -11,20 +11,20 @@ app = FastAPI()
 
 @app.get("/")
 def root():
-    return {"message": "Dynamic Signature API Running ✅"}
+    return {"message": "Smart Signature API Running ✅"}
 
 @app.post("/signature")
 async def extract_signature(pdf: UploadFile = File(...)):
     try:
-        # --- Step 1: Save PDF temporarily ---
+        # Step 1: Save PDF temporarily
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
             tmp.write(await pdf.read())
             pdf_path = tmp.name
 
-        # --- Step 2: Convert first page to image ---
+        # Step 2: Convert first page to image
         pdf_doc = fitz.open(pdf_path)
         page = pdf_doc.load_page(0)
-        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))  # High DPI
+        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
         img_data = pix.tobytes("png")
         pdf_doc.close()
 
@@ -35,34 +35,52 @@ async def extract_signature(pdf: UploadFile = File(...)):
 
         H, W, _ = img.shape
 
-        # --- Step 3: Detect face (user photo) ---
+        # Step 3: Detect face
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
         faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=4, minSize=(60, 60))
 
         if len(faces) == 0:
-            # fallback: use typical left-top region for photo
             user_y, user_h = int(H * 0.25), int(H * 0.25)
             user_x, user_w = int(W * 0.08), int(W * 0.25)
         else:
-            (user_x, user_y, user_w, user_h) = faces[0]  # Take first detected face
+            (user_x, user_y, user_w, user_h) = faces[0]
 
-        # --- Step 4: Define signature region BELOW the user photo ---
-        sig_y = int(user_y + user_h + (H * 0.05))
-        sig_h = int(user_h * 0.7)
-        sig_x = int(user_x)
-        sig_w = int(user_w * 1.5)
+        # Step 4: Region below user photo to search for signature box
+        sig_y1 = int(user_y + user_h + (H * 0.05))
+        sig_y2 = int(sig_y1 + user_h * 2.2)
+        sig_y2 = min(sig_y2, H)
 
-        # Safety boundary
-        sig_y = min(sig_y, H - sig_h)
-        sig_h = min(sig_h, H - sig_y)
-        sig_x = min(sig_x, W - sig_w)
-        sig_w = min(sig_w, W - sig_x)
+        search_area = img[sig_y1:sig_y2, :]
+        gray_crop = cv2.cvtColor(search_area, cv2.COLOR_BGR2GRAY)
+        edges = cv2.Canny(gray_crop, 50, 150)
 
-        signature_crop = img[sig_y:sig_y + sig_h, sig_x:sig_x + sig_w]
+        # Step 5: Find rectangular contours (signature box)
+        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        box = None
+        for cnt in contours:
+            x, y, w, h = cv2.boundingRect(cnt)
+            aspect = w / h if h > 0 else 0
+            area = w * h
+            if 2.5 < aspect < 8 and 20000 < area < 250000:  # typical signature box
+                box = (x, y, w, h)
+                break
 
-        # --- Step 5: Convert to Base64 image ---
-        sig_pil = Image.fromarray(cv2.cvtColor(signature_crop, cv2.COLOR_BGR2RGB))
+        if box is None:
+            return JSONResponse({"success": False, "message": "Signature box not found"})
+
+        x, y, w, h = box
+        pad = 8  # small padding inside border
+        y1 = max(y + pad, 0)
+        y2 = min(y + h - pad, search_area.shape[0])
+        x1 = max(x + pad, 0)
+        x2 = min(x + w - pad, search_area.shape[1])
+
+        # Step 6: Crop inside box only (remove borders)
+        cropped = search_area[y1:y2, x1:x2]
+
+        # Step 7: Convert to Base64
+        sig_pil = Image.fromarray(cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB))
         buf = tempfile.SpooledTemporaryFile()
         sig_pil.save(buf, format="JPEG", quality=90)
         buf.seek(0)
@@ -74,7 +92,7 @@ async def extract_signature(pdf: UploadFile = File(...)):
             "signatureIMG": f"data:image/jpeg;base64,{b64_sig}",
             "debug": {
                 "user_face_box": [int(user_x), int(user_y), int(user_w), int(user_h)],
-                "sig_crop_box": [int(sig_x), int(sig_y), int(sig_w), int(sig_h)],
+                "sig_box": [int(x), int(y + sig_y1), int(w), int(h)],
                 "page_size": [W, H]
             }
         })
