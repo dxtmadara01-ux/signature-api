@@ -11,7 +11,7 @@ app = FastAPI()
 
 @app.get("/")
 def root():
-    return {"message": "Smart Signature API Running ✅"}
+    return {"message": "Smart Signature Box Detection API ✅"}
 
 @app.post("/signature")
 async def extract_signature(pdf: UploadFile = File(...)):
@@ -48,39 +48,54 @@ async def extract_signature(pdf: UploadFile = File(...)):
 
         # Step 4: Region below user photo to search for signature box
         sig_y1 = int(user_y + user_h + (H * 0.05))
-        sig_y2 = int(sig_y1 + user_h * 2.2)
+        sig_y2 = int(sig_y1 + user_h * 2.5)
         sig_y2 = min(sig_y2, H)
-
         search_area = img[sig_y1:sig_y2, :]
-        gray_crop = cv2.cvtColor(search_area, cv2.COLOR_BGR2GRAY)
-        edges = cv2.Canny(gray_crop, 50, 150)
 
-        # Step 5: Find rectangular contours (signature box)
-        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        box = None
+        gray_crop = cv2.cvtColor(search_area, cv2.COLOR_BGR2GRAY)
+
+        # --- enhance contrast and edges ---
+        gray_eq = cv2.equalizeHist(gray_crop)
+        blurred = cv2.GaussianBlur(gray_eq, (3, 3), 0)
+        edges = cv2.Canny(blurred, 40, 120)
+        dilated = cv2.dilate(edges, np.ones((3, 3), np.uint8), iterations=2)
+        closed = cv2.morphologyEx(dilated, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+
+        # Step 5: Find rectangular contours
+        contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        candidate_boxes = []
         for cnt in contours:
             x, y, w, h = cv2.boundingRect(cnt)
             aspect = w / h if h > 0 else 0
             area = w * h
-            if 2.5 < aspect < 8 and 20000 < area < 250000:  # typical signature box
-                box = (x, y, w, h)
-                break
+            if 2.0 < aspect < 9 and 15000 < area < 300000:
+                candidate_boxes.append((x, y, w, h))
 
-        if box is None:
-            return JSONResponse({"success": False, "message": "Signature box not found"})
+        if len(candidate_boxes) == 0:
+            # fallback: crop directly below user photo
+            sig_y = int(user_y + user_h + (H * 0.07))
+            sig_h = int(user_h * 1.2)
+            sig_x = int(user_x - (user_w * 0.2))
+            sig_w = int(user_w * 1.8)
+            sig_y = min(sig_y, H - sig_h)
+            sig_h = min(sig_h, H - sig_y)
+            sig_x = max(0, sig_x)
+            sig_w = min(sig_w, W - sig_x)
+            signature_crop = img[sig_y:sig_y + sig_h, sig_x:sig_x + sig_w]
+            msg = "Fallback used (box not detected)"
+        else:
+            # choose the largest candidate box
+            x, y, w, h = max(candidate_boxes, key=lambda b: b[2] * b[3])
+            pad = 10
+            y1 = max(y + pad, 0)
+            y2 = min(y + h - pad, search_area.shape[0])
+            x1 = max(x + pad, 0)
+            x2 = min(x + w - pad, search_area.shape[1])
+            signature_crop = search_area[y1:y2, x1:x2]
+            msg = "Signature box detected successfully"
 
-        x, y, w, h = box
-        pad = 8  # small padding inside border
-        y1 = max(y + pad, 0)
-        y2 = min(y + h - pad, search_area.shape[0])
-        x1 = max(x + pad, 0)
-        x2 = min(x + w - pad, search_area.shape[1])
-
-        # Step 6: Crop inside box only (remove borders)
-        cropped = search_area[y1:y2, x1:x2]
-
-        # Step 7: Convert to Base64
-        sig_pil = Image.fromarray(cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB))
+        # Step 6: Convert to Base64
+        sig_pil = Image.fromarray(cv2.cvtColor(signature_crop, cv2.COLOR_BGR2RGB))
         buf = tempfile.SpooledTemporaryFile()
         sig_pil.save(buf, format="JPEG", quality=90)
         buf.seek(0)
@@ -88,13 +103,8 @@ async def extract_signature(pdf: UploadFile = File(...)):
 
         return JSONResponse({
             "success": True,
-            "message": "Signature extracted successfully",
-            "signatureIMG": f"data:image/jpeg;base64,{b64_sig}",
-            "debug": {
-                "user_face_box": [int(user_x), int(user_y), int(user_w), int(user_h)],
-                "sig_box": [int(x), int(y + sig_y1), int(w), int(h)],
-                "page_size": [W, H]
-            }
+            "message": msg,
+            "signatureIMG": f"data:image/jpeg;base64,{b64_sig}"
         })
 
     except Exception as e:
